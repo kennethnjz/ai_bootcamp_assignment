@@ -1,1 +1,8 @@
-
+streamlit
+openai
+tiktoken
+python-dotenv
+langchain
+langchain-openai
+langchain-experimental
+pandas
