@@ -4,5 +4,8 @@ tiktoken
 python-dotenv
 langchain
 langchain-openai
+langchain-community
 langchain-experimental
+chromadb
+pypdf
 pandas
