@@ -1,258 +1,158 @@
 import os
-import tempfile
-
+import traceback
 import streamlit as st
+import tempfile
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
-from langchain_community.vectorstores import Chroma
-from langchain_openai import OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from openai import OpenAI
+from dotenv import load_dotenv
+from langchain_openai import OpenAIEmbeddings
+from langchain_chroma import Chroma
 
-# Load from .env file if present (create one with: OPENAI_API_KEY=sk-...)
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
-
-st.set_page_config(
-    page_title="AI Chatbot",
-    page_icon="🤖",
-)
-
-st.title("AI Chatbot")
-
+#load_dotenv()
+#st.write("OPENAI_API_KEY:", st.secrets["OPENAI_API_KEY"])
+os.environ['OPENAI_API_KEY'] = st.secrets["OPENAI_API_KEY"]
+client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 def load_and_split(uploaded_file, chunk_size=800, chunk_overlap=100):
-    file_name = uploaded_file.name.lower()
-    extension = os.path.splitext(file_name)[1] or ".txt"
-    suffix = extension if extension in {".pdf", ".txt"} else ".txt"
-
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
-        temp_file.write(uploaded_file.getvalue())
-        temp_path = temp_file.name
-
+    ext = ".txt" if uploaded_file.name.endswith(".txt") else ".pdf"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(uploaded_file.read())
+        tmp_path = tmp.name
     try:
-        if extension == ".pdf":
-            loader = PyPDFLoader(temp_path)
-        else:
-            loader = TextLoader(temp_path, encoding="utf-8")
-
-        documents = loader.load()
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-        )
-        return splitter.split_documents(documents)
+        loader = TextLoader(tmp_path, encoding="utf-8") if ext == ".txt" else PyPDFLoader(tmp_path)
+        docs = loader.load()
     finally:
-        os.remove(temp_path)
+        os.remove(tmp_path)
+    return RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size, chunk_overlap=chunk_overlap
+    ).split_documents(docs)
 
 
 @st.cache_resource
 def build_vectorstore(_chunks):
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-small", api_key=os.environ["OPENAI_API_KEY"])
-    return Chroma.from_documents(_chunks, embedding=embeddings, persist_directory=None)
-
+    return Chroma.from_documents(_chunks, OpenAIEmbeddings(model="text-embedding-3-small"))
 
 def retrieve_context(vectorstore, query, k=4):
+    print("calling retrieve_context")
     retriever = vectorstore.as_retriever(search_kwargs={"k": k})
-    documents = retriever.invoke(query)
-    joined_context = "\n\n---\n\n".join(doc.page_content for doc in documents)
-    return joined_context, documents
+    docs = retriever.invoke(query)
+    return "\n\n---\n\n".join(doc.page_content for doc in docs), docs
+
+def build_rag_system_prompt(context):
+    print("calling build_rag_system_prompt")
+    return (
+        "Answer ONLY using the context below. "
+        "If the answer is not in the context, say \"I couldn't find that information in the uploaded document.\"\n\n"
+        f"Context:\n{context}"
+    )
+
+st.set_page_config(page_title="AI Chatbot", page_icon="🤖")
+
+st.title("AI Chatbot")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-if "system_prompt" not in st.session_state:
-    st.session_state.system_prompt = "You are a helpful assistant."
-
-if "selected_model" not in st.session_state:
-    st.session_state.selected_model = "gpt-4o-mini"
-
-if "temperature" not in st.session_state:
-    st.session_state.temperature = 1.0
-
-if "selected_language" not in st.session_state:
-    st.session_state.selected_language = "English"
-
-if "vectorstore" not in st.session_state:
-    st.session_state.vectorstore = None
-
-if "files_key" not in st.session_state:
-    st.session_state.files_key = ()
-
-chunk_size = 800
-chunk_overlap = 100
-
 with st.sidebar:
-    uploaded_files = st.file_uploader(
-        "📄 Upload a Document",
-        type=["pdf", "txt"],
-        accept_multiple_files=True,
-    )
+    st.header("⚙️ Settings")
+    
+    chunk_size = st.number_input("Chunk Size", min_value=100, max_value=4000, value=800, step=100)
+    chunk_overlap = st.number_input("Chunk Overlap", min_value=0, max_value=500, value=100, step=10)
 
-    if uploaded_files:
-        current_files_key = tuple(sorted(file.name for file in uploaded_files))
-        if current_files_key != st.session_state.files_key:
-            all_chunks = []
-            for uploaded_file in uploaded_files:
-                all_chunks.extend(
-                    load_and_split(uploaded_file, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-                )
-            st.session_state.vectorstore = build_vectorstore(all_chunks)
-            st.session_state.files_key = current_files_key
+    uploaded_file = st.file_uploader("📄 Upload a Document", type=["txt", "pdf"])
+    if uploaded_file:
+        st.session_state.pop("doc_summary", None)
+        chunks = load_and_split(uploaded_file, chunk_size, chunk_overlap)
+        st.session_state.vectorstore = build_vectorstore(chunks)
+        st.success(f"Ready! Indexed {len(chunks)} chunks.")
 
-        st.success(f"Ready! Indexed {len(all_chunks)} chunks from {len(uploaded_files)} file(s).")
-        for uploaded_file in uploaded_files:
-            ext = os.path.splitext(uploaded_file.name)[1] or ""
-            st.write(f"✓ {uploaded_file.name}{ext}")
+        if "doc_summary" not in st.session_state:
+            full_text = " ".join(chunk.page_content for chunk in chunks)[:4000]
+            summary_response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "Summarize the following document in one paragraph."},
+                    {"role": "user", "content": full_text},
+                ],
+            )
+            st.session_state.doc_summary = summary_response.choices[0].message.content
+
+        st.info(f"📋 **Summary:** {st.session_state.doc_summary}")
     else:
         st.info("Upload a PDF or TXT to enable document Q&A.")
+        system_prompt_no_doc = "You are a helpful assistant."
+    st.divider()
 
-    chunk_size = st.number_input(
-        "Chunk size",
-        min_value=100,
-        value=800,
-        step=50,
-    )
-    chunk_overlap = st.number_input(
-        "Chunk overlap",
-        min_value=0,
-        value=100,
-        step=10,
-    )
-    k_value = st.slider(
-        "Chunks to retrieve (k)",
-        min_value=1,
-        max_value=10,
-        value=4,
-    )
+    k_value = st.slider("Chunks to retrieve (k)", min_value=1, max_value=10, value=4)
 
-    st.header("⚙️ Settings")
-    persona_options = {
+    PERSONAS = {
         "Helpful Assistant": "You are a helpful assistant.",
-        "Singlish Hawker Uncle": "You are a friendly hawker uncle who only talks about Singapore food in Singlish.",
-        "Strict Grammar Teacher": "You correct every grammar mistake before answering.",
+        "Singlish Hawker Uncle": "Friendly uncle, Singapore food only, Singlish phrases.",
+        "Strict Grammar Teacher": "Corrects grammar before answering.",
     }
+    selected_persona = st.selectbox("Persona", list(PERSONAS.keys()))
+    system_prompt = PERSONAS[selected_persona]
+    st.caption(f"📝 {system_prompt}")
 
-    selected_persona = st.selectbox(
-        "Persona",
-        options=list(persona_options.keys()),
-        index=list(persona_options.keys()).index(
-            next(
-                (name for name, prompt in persona_options.items() if prompt == st.session_state.system_prompt),
-                "Helpful Assistant",
-            )
-        ),
-    )
-    st.session_state.system_prompt = persona_options[selected_persona]
-
-    st.session_state.selected_model = st.selectbox(
-        "Model",
-        ["gpt-4o-mini", "gpt-4o"],
-        index=["gpt-4o-mini", "gpt-4o"].index(st.session_state.selected_model),
-    )
-
-    st.session_state.selected_language = st.selectbox(
-        "Reply Language",
-        ["English", "Malay", "Chinese", "Tamil"],
-        index=["English", "Malay", "Chinese", "Tamil"].index(st.session_state.selected_language),
-    )
-
-    st.session_state.temperature = st.slider(
-        "Temperature",
-        min_value=0.0,
-        max_value=2.0,
-        value=float(st.session_state.temperature),
-        step=0.1,
-    )
-
+    model = st.selectbox("Model", ["gpt-4o-mini", "gpt-4o"])
+    temperature = st.slider("Temperature", min_value=0.0, max_value=2.0, value=1.0, step=0.1)
     if st.button("Clear Conversation"):
         st.session_state.messages = []
         st.rerun()
+    chars_placeholder = st.empty()
+    download_placeholder = st.empty()
 
-    total_chars = sum(len(msg["content"]) for msg in st.session_state.messages)
-    st.caption(f"Conversation characters: {total_chars}")
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.write(msg["content"])
 
-    chat_text = "\n".join(
-        f"[{message['role']}]: {message['content']}" for message in st.session_state.messages
-    )
-    st.download_button(
-        label="📥 Download Chat",
-        data=chat_text,
-        file_name="conversation.txt",
-        mime="text/plain",
-    )
-
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-
-def build_rag_system_prompt(context, persona_prompt):
-    return (
-        f"{persona_prompt} "
-        "You answer ONLY from the provided context. "
-        'If the answer is not in the context, say: '
-        '"I couldn\'t find that information in the uploaded document."'
-        f"\n\nContext:\n{context}"
-    )
-
-system_prompt_no_doc = st.session_state.system_prompt
-
-prompt = st.chat_input("Type your message here...")
-
-if prompt is not None:
+if prompt := st.chat_input("Type a message..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
-
     with st.chat_message("user"):
-        st.markdown(prompt)
+        st.write(prompt)
 
-    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-    collected_chunks = []
-
-    base_prompt = st.session_state.system_prompt
-
-    retrieved_documents = []
-
-    if "vectorstore" in st.session_state and st.session_state.vectorstore is not None:
-        context, retrieved_documents = retrieve_context(st.session_state.vectorstore, prompt, k_value)
-        base_prompt = build_rag_system_prompt(context, base_prompt)
-    else:
-        base_prompt = system_prompt_no_doc
-
-    system_prompt = f"{base_prompt} Always reply in {st.session_state.selected_language}."
-    api_messages = [{"role": "system", "content": system_prompt}] + st.session_state.messages
-
-    try:
-        def stream_response():
-            for chunk in client.chat.completions.create(
-                model=st.session_state.selected_model,
+    with st.chat_message("assistant"):
+        try:
+            
+            if "vectorstore" in st.session_state:
+                context, source_docs = retrieve_context(st.session_state.vectorstore, prompt, k_value)
+                effective_system_prompt = build_rag_system_prompt(context)
+            else:
+                effective_system_prompt = system_prompt_no_doc
+            
+            api_messages = [{"role": "system", "content": effective_system_prompt}] + st.session_state.messages
+            stream = client.chat.completions.create(
+                model=model,
                 messages=api_messages,
-                temperature=st.session_state.temperature,
+                temperature=temperature,
                 stream=True,
-            ):
-                delta = chunk.choices[0].delta.content or ""
-                if delta:
-                    collected_chunks.append(delta)
-                    yield delta
+            )
+            reply = st.write_stream(stream)
+            
+            if "vectorstore" in st.session_state:
+                with st.expander("🔍 View Sources"):
+                    for i, doc in enumerate(source_docs, 1):
+                        st.markdown(f"**Chunk {i}**")
+                        st.caption(doc.page_content)
+            
+        except Exception as e:
+            traceback.print_exc()
+            reply = "⚠️ Sorry, something went wrong. Please try again."
+            st.error(reply)
+    st.session_state.messages.append({"role": "assistant", "content": reply})
 
-        with st.chat_message("assistant"):
-            st.write_stream(stream_response())
-
-        assistant_reply = "".join(collected_chunks)
-        st.session_state.messages.append(
-            {"role": "assistant", "content": assistant_reply}
-        )
-
-        if retrieved_documents:
-            with st.expander("🔍 View Sources"):
-                for idx, doc in enumerate(retrieved_documents, start=1):
-                    st.markdown(f"**Chunk {idx}**")
-                    st.text(doc.page_content)
-    except Exception as e:
-        print(f"OpenAI API error: {e}")
-        st.error("Sorry, I couldn't complete that request right now.")
-        st.session_state.messages.append(
-            {"role": "assistant", "content": "Sorry, I couldn't complete that request right now."}
-        )
-
+# Update sidebar placeholders after messages are finalized
+total_chars = sum(len(msg["content"]) for msg in st.session_state.messages)
+chars_placeholder.caption(f"💬 Total characters in history: {total_chars}")
+conversation_text = "\n".join(
+    f"{msg['role'].upper()}: {msg['content']}"
+    for msg in st.session_state.messages
+)
+download_placeholder.download_button(
+    label="📥 Download Conversation",
+    data=conversation_text,
+    file_name="conversation.txt",
+    mime="text/plain",
+    disabled=len(st.session_state.messages) == 0,
+)
