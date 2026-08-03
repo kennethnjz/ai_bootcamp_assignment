@@ -1,4 +1,5 @@
 streamlit
+matplotlib
 openai
 bcrypt
 openpyxl

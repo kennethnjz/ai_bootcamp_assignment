@@ -2,6 +2,10 @@
 import json
 # Standard library import for all pattern matching used in job extraction.
 import re
+# Plotting library used by st.pyplot histogram rendering.
+import matplotlib.pyplot as plt
+# Plotly is used for interactive histogram zooming.
+import plotly.graph_objects as go
 # Used to print full stack traces when chat calls fail.
 import traceback
 
@@ -75,6 +79,164 @@ def build_sequence_diagram_prompt(context: str) -> str:
         "11. Do not add any prose outside the JSON object.\n"
         f"Context:\n{context}"
     )
+
+
+def build_hourly_jobs_prompt(context: str) -> str:
+    """Create prompt that asks for hourly job-count JSON in a fixed 24-hour schema."""
+    return (
+        "You are given job run details from retrieved operating-manual context. "
+        "Return only one JSON object with no markdown fences and no extra text.\n\n"
+        "Output schema (must include all hours 0-23):\n"
+        '{\n'
+        '  "hourly_job_counts": [\n'
+        '    {"hour": 0, "job_count": 0},\n'
+        '    {"hour": 1, "job_count": 0}\n'
+        '  ]\n'
+        '}\n\n'
+        "Rules:\n"
+        "1. Include exactly 24 entries, one per hour from 0 to 23.\n"
+        "2. hour must be an integer in [0, 23].\n"
+        "3. job_count must be a non-negative integer.\n"
+        "4. Use only explicit evidence from context. If unknown for an hour, use 0.\n"
+        "5. Return valid JSON parseable by json.loads().\n\n"
+        f"Context:\n{context}"
+    )
+
+
+def parse_hourly_job_counts(hourly_json: str) -> tuple[list[int], dict]:
+    """Parse hourly job-count JSON into a fixed-size 24-value list for plotting."""
+    # Drop optional markdown fencing if the model wrapped JSON output.
+    hourly_json = hourly_json.replace("```json", "").replace("```", "").strip()
+    # Start with a zero-filled 24-hour vector.
+    counts = [0] * 24
+
+    try:
+        payload = json.loads(hourly_json)
+    except Exception:
+        return counts, {"hourly_job_counts": [{"hour": h, "job_count": 0} for h in range(24)]}
+
+    if not isinstance(payload, dict):
+        return counts, {"hourly_job_counts": [{"hour": h, "job_count": 0} for h in range(24)]}
+
+    # Preferred schema: list of objects under hourly_job_counts.
+    rows = payload.get("hourly_job_counts")
+    if isinstance(rows, list):
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            hour = item.get("hour")
+            job_count = item.get("job_count")
+            try:
+                hour_int = int(hour)
+                count_int = max(0, int(job_count))
+            except Exception:
+                continue
+            if 0 <= hour_int <= 23:
+                counts[hour_int] = count_int
+    else:
+        # Fallback schema: mapping {"0": 3, "1": 0, ...}.
+        mapping = payload.get("hourly") or payload.get("hourly_counts") or payload.get("by_hour")
+        if isinstance(mapping, dict):
+            for key, value in mapping.items():
+                try:
+                    hour_int = int(key)
+                    count_int = max(0, int(value))
+                except Exception:
+                    continue
+                if 0 <= hour_int <= 23:
+                    counts[hour_int] = count_int
+
+    normalized_payload = {
+        "hourly_job_counts": [
+            {"hour": hour, "job_count": counts[hour]}
+            for hour in range(24)
+        ]
+    }
+    return counts, normalized_payload
+
+
+def build_hourly_jobs_histogram(store) -> tuple[list[int], dict]:
+    """Retrieve schedule context and ask model for hourly job-count JSON."""
+    retrieval_prompt = (
+        "List all job run time information, schedules, trigger times, and hourly frequencies "
+        "from the available documents."
+    )
+    context, _ = retrieve_context(store, retrieval_prompt, k=25)
+    system_prompt = build_hourly_jobs_prompt(context)
+
+    response = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "system", "content": system_prompt}],
+        temperature=0,
+        stream=False,
+    )
+    raw_json = response.choices[0].message.content.strip()
+    return parse_hourly_job_counts(raw_json)
+
+
+def render_hourly_histogram(hourly_counts: list[int], chart_title: str = "Hourly Job Distribution"):
+    """Render a 24-hour histogram-style bar chart using st.pyplot."""
+    fig, ax = plt.subplots(figsize=(12, 4))
+    ax.bar(list(range(24)), hourly_counts)
+    ax.set_xlabel("Hour of Day (0-23)")
+    ax.set_ylabel("Number of Jobs")
+    ax.set_title(chart_title)
+    ax.set_xticks(list(range(24)))
+    st.pyplot(fig)
+    plt.close(fig)
+
+
+def render_visualization_widget(sequence_diagram: str, graphviz_diagram: str, hourly_counts: list[int]):
+    """Render one visualization at a time in a selector-driven widget."""
+    selected_view = st.radio(
+        "Choose a visualization",
+        ["Sequence Diagram", "Job Dependency Graph", "Jobs Run by Hour"],
+        horizontal=True,
+        key="visualization_widget_selector",
+    )
+
+    if selected_view == "Sequence Diagram":
+        st.mermaid_chart(sequence_diagram)
+    elif selected_view == "Job Dependency Graph":
+        st.graphviz_chart(graphviz_diagram)
+    else:
+        render_hourly_histogram(hourly_counts, chart_title="Jobs Run by Hour")
+
+
+def render_hourly_histogram_plotly(hourly_counts: list[int]):
+    """Render an interactive hourly histogram that supports zoom and pan."""
+    fig = go.Figure(
+        data=[
+            go.Bar(
+                x=list(range(24)),
+                y=hourly_counts,
+                marker_color="#1f77b4",
+                hovertemplate="Hour %{x}:00<br>Jobs %{y}<extra></extra>",
+            )
+        ]
+    )
+    fig.update_layout(
+        title="Jobs Run by Hour",
+        xaxis_title="Hour of Day (0-23)",
+        yaxis_title="Number of Jobs",
+        xaxis=dict(dtick=1),
+        margin=dict(l=20, r=20, t=50, b=40),
+    )
+    st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True})
+
+
+def render_visualization_fullscreen(sequence_diagram: str, graphviz_diagram: str, hourly_counts: list[int]):
+    """Render a full-page visualization viewer with no modal clipping."""
+    st.subheader("Visualization Viewer")
+    st.caption("Histogram supports mouse/trackpad zoom.")
+    tabs = st.tabs(["Sequence Diagram", "Job Dependency Graph", "Jobs Run by Hour"])
+
+    with tabs[0]:
+        st.mermaid_chart(sequence_diagram)
+    with tabs[1]:
+        st.graphviz_chart(graphviz_diagram)
+    with tabs[2]:
+        render_hourly_histogram_plotly(hourly_counts)
 
 
 def sanitize_mermaid_identifier(name: str) -> str:
@@ -535,15 +697,39 @@ if store is not None:
     with st.spinner("Preparing run sequence diagram..."):
         sequence_diagram, graphviz_diagram = build_run_sequence_diagram(store)
 
-    # Render Mermaid run sequence section title.
-    st.subheader("Job Run Sequence")
-    # Render Mermaid sequence diagram text.
-    st.mermaid_chart(sequence_diagram)
+    # Build a lightweight key so this expensive prompt runs only when store shape changes.
+    histogram_cache_key = (
+        active_owner.lower(),
+        len(store_meta.get("ids", [])),
+    )
 
-    # Render Graphviz dependency section title.
-    st.subheader("Job Dependency Graph")
-    # Render Graphviz digraph text.
-    st.graphviz_chart(graphviz_diagram)
+    # Recompute hourly distribution only when the source store has changed.
+    if st.session_state.get("hourly_jobs_cache_key") != histogram_cache_key:
+        with st.spinner("Preparing hourly jobs histogram..."):
+            hourly_counts, hourly_payload = build_hourly_jobs_histogram(store)
+        st.session_state.hourly_jobs_cache_key = histogram_cache_key
+        st.session_state.hourly_jobs_counts = hourly_counts
+        st.session_state.hourly_jobs_payload = hourly_payload
+
+    # Read cached values for stable rendering across reruns.
+    hourly_counts = st.session_state.get("hourly_jobs_counts", [0] * 24)
+    hourly_payload = st.session_state.get(
+        "hourly_jobs_payload",
+        {"hourly_job_counts": [{"hour": hour, "job_count": 0} for hour in range(24)]},
+    )
+
+    # Show a button-like trigger that opens a full-page visualization viewer.
+    if "show_visualization_viewer" not in st.session_state:
+        st.session_state.show_visualization_viewer = False
+
+    if st.button("Open Visualization Widget", key="open_visualization_widget_btn"):
+        st.session_state.show_visualization_viewer = True
+
+    if st.session_state.show_visualization_viewer:
+        if st.button("Close Visualization Widget", key="close_visualization_widget_btn"):
+            st.session_state.show_visualization_viewer = False
+        else:
+            render_visualization_fullscreen(sequence_diagram, graphviz_diagram, hourly_counts)
 else:
     # Inform user that no store exists yet for retrieval-backed behavior.
     st.info("No vector store is available in this session yet.")

@@ -5,7 +5,7 @@ import traceback
 import streamlit as st
 # OpenAI SDK client for chat completion calls.
 from openai import OpenAI
-# Chroma vector store class for persisted embeddings retrieval.
+# Chroma vector store class for Chroma Cloud embeddings retrieval.
 from langchain_chroma import Chroma
 # Authentication and user-scoped vector-store utilities from local module.
 from auth import is_logged_in, current_user, logout
@@ -40,13 +40,13 @@ system_prompt_no_doc = "You are a helpful assistant."
 
 
 def load_persisted_store_for(user_id: str) -> Chroma | None:
-    """Load app-cached persisted Chroma vector store by owner id if present."""
+    """Load app-cached Chroma Cloud vector store by owner id if present."""
     # Resolve shared app-level cached handle for this owner id.
     return get_cached_vectorstore(user_id)
 
 
 def load_persisted_user_store() -> Chroma | None:
-    """Load the logged-in user's persisted Chroma vector store from disk if present."""
+    """Load the logged-in user's Chroma Cloud vector store if present."""
     # Load the store keyed to the currently logged-in user id.
     return load_persisted_store_for(current_user())
 
@@ -88,9 +88,9 @@ if "messages" not in st.session_state:
 
 # Resolve vector store for this request using shared app-level cache.
 active_owner = current_user()
-# First preference: the logged-in user's own persisted store.
+# First preference: the logged-in user's own Chroma Cloud collection.
 store = load_persisted_user_store()
-# Fallback: shared admin-indexed store under the literal "user" scope.
+# Fallback: shared admin-indexed Chroma Cloud collection under the literal "user" scope.
 if store is None:
     store = load_persisted_store_for("user")
     if store is not None:
