@@ -638,7 +638,7 @@ def load_persisted_user_store() -> Chroma | None:
 
 # Initialize default retrieval depth in session state.
 if "k_value" not in st.session_state:
-    st.session_state.k_value = 4
+    st.session_state.k_value = 100
 # Initialize default chat model in session state.
 if "model" not in st.session_state:
     st.session_state.model = "gpt-4o-mini"
