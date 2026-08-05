@@ -1,372 +1,225 @@
-# Standard library helper for generating deterministic content hashes per row.
-import hashlib
-# Pandas is used to read and transform Excel rows before embedding.
-import pandas as pd
-# Streamlit powers the page UI, widgets, and per-session state.
-import streamlit as st
-# BytesIO allows treating uploaded in-memory bytes as file-like input for pandas.
-from io import BytesIO
-# LangChain Chroma wrapper used as the persistent vector store.
-from langchain_chroma import Chroma
-# LangChain Document object wraps row text and metadata for indexing.
-from langchain_core.documents import Document
-# Local auth/session helpers and vector-store key/path helpers.
-from auth import is_logged_in, current_user, logout
-# Shared app-level cache helpers for vector store reuse and invalidation.
-from vectorstore_cache import get_cached_vectorstore, get_or_create_cached_vectorstore, clear_vectorstore_cache
+import hashlib          # for generating MD5 hashes to detect row changes
+import pandas as pd     # for reading and manipulating Excel data
+import streamlit as st  # for building the web UI
+from io import BytesIO  # for treating the uploaded file bytes as a file-like object
+from langchain_chroma import Chroma                    # vector store backed by ChromaDB
+from langchain_core.documents import Document          # LangChain's document wrapper (content + metadata)
+from langchain_openai import OpenAIEmbeddings          # OpenAI embedding model to convert text to vectors
+from auth import is_logged_in, current_user, logout    # custom auth helpers (your own module)
+from pages.store_utils import get_shared_store, get_store_summary
 
 
-# -----------------------------
-# Vector Store Load Helpers
-# -----------------------------
-def load_persisted_user_store() -> Chroma | None:
-    """Load the shared user vector store from Chroma Cloud, if it exists."""
-    # Return app-cached shared store handle for all sessions.
-    return get_cached_vectorstore("user")
-
-
-def get_session_vectorstore():
-    """Return the app-level cached shared store handle."""
-    # Return the app-level cached shared store handle.
-    return load_persisted_user_store()
-
-
-# -----------------------------
-# Parsing and Document Builders
-# -----------------------------
 def _row_hash(text: str) -> str:
-    """Generate a stable MD5 hash for row content to detect changes."""
-    # Encode to bytes and return MD5 hex digest.
+    # Generates a short MD5 fingerprint of a row's text content.
+    # Used later to detect whether a row has changed between uploads —
+    # if the hash is the same, the row hasn't changed and doesn't need re-indexing.
     return hashlib.md5(text.encode()).hexdigest()
 
 
 def load_and_split(file, system_code: str) -> list[Document]:
-    """Read one Excel file and convert each valid row into a LangChain Document."""
-    # Read OM sheet from uploaded .xlsx bytes.
+    # Read the uploaded Excel file into a pandas DataFrame.
+    # BytesIO wraps the raw file bytes so pandas can treat it like a file on disk.
+    # engine="openpyxl" explicitly uses the openpyxl library to parse .xlsx files.
     df = pd.read_excel(BytesIO(file.read()), engine="openpyxl", sheet_name="OM")
 
-    # Remove fully empty rows and normalize the index after filtering.
+    # Drop rows where every single column is NaN (completely empty rows),
+    # then reset the index so it runs 0, 1, 2, ... cleanly after dropping.
     df = df.dropna(how="all").reset_index(drop=True)
 
-    # Accumulator for generated documents.
-    docs = []
+    docs = []  # will hold the final list of LangChain Document objects
 
-    # Iterate each row and build searchable text + metadata.
-    for _, row in df.iterrows():
-        # Flatten all columns into a single searchable string chunk.
+    for _, row in df.iterrows():  # iterate over each row; _ discards the row index
+        # Concatenate all column-value pairs into a single string, e.g.:
+        # "Job Name: DKSD001 | Job Frequency: Daily | Description: FTP receive..."
+        # This becomes the text that gets embedded and searched later.
         text = " | ".join(f"{col}: {val}" for col, val in row.items())
 
-        # Pull and normalize job name from the required column.
+        # Extract the job name and clean up whitespace
         job_name = str(row["Job Name"]).strip()
 
-        # Skip invalid rows where the job name is missing.
+        # Skip rows with no valid job name — these are likely header continuations
+        # or empty rows that slipped through the dropna above.
         if not job_name or job_name.lower() == "nan":
             continue
 
-        # Create document with content and metadata used by filters/upserts.
-        docs.append(
-            Document(
-                page_content=text,
-                metadata={
-                    "job_name": job_name,
-                    "row_hash": _row_hash(text),
-                    "system_code": system_code,
-                },
-            )
-        )
+        # Wrap the text in a LangChain Document with metadata.
+        # page_content is what gets embedded and retrieved.
+        # metadata carries structured fields for filtering, change detection,
+        # and scoping deletions to the correct system.
+        docs.append(Document(
+            page_content=text,
+            metadata={
+                "job_name": job_name,
+                "row_hash": _row_hash(text),  # fingerprint for change detection
+                "system_code": system_code     # identifies which system this job belongs to
+            }
+        ))
 
-    # Return all parsed documents from this file.
     return docs
 
-
-# -----------------------------
-# Store Summary and Construction
-# -----------------------------
-def get_store_summary(vs: Chroma) -> pd.DataFrame:
-    """Build a per-system summary table from all vector-store metadata."""
-    # Pull all metadatas from the store.
-    all_metas = vs.get()["metadatas"]
-    # Counter map keyed by system_code.
-    counts = {}
-    # Count each metadata row into its system bucket.
-    for meta in all_metas:
-        code = meta.get("system_code", "Unknown")
-        counts[code] = counts.get(code, 0) + 1
-    # Return sorted table for display.
-    return pd.DataFrame(
-        [{"System Code": code, "Jobs in Store": count} for code, count in sorted(counts.items())]
+def build_vectorstore(docs: list[Document]) -> Chroma:
+    # Initialise the OpenAI embedding model.
+    # text-embedding-3-small is cost-efficient and accurate enough for this use case.
+    # api_key is pulled from Streamlit's secrets manager (secrets.toml), not hardcoded.
+    embeddings = OpenAIEmbeddings(
+        model="text-embedding-3-small",
+        api_key=st.secrets["OPENAI_API_KEY"],
     )
 
-
-def build_vectorstore(docs: list[Document], user_id: str) -> Chroma:
-    """Create or append documents into the Chroma Cloud collection for this user scope."""
-    store = get_or_create_cached_vectorstore(user_id)
-    if docs:
-        store.add_documents(docs)
-    clear_vectorstore_cache()
-    return get_or_create_cached_vectorstore(user_id)
+    # Create a new in-memory Chroma vector store from the documents.
+    # This embeds all documents and stores their vectors in memory.
+    # No persist_directory is set, so this lives only for the session lifetime.
+    return Chroma.from_documents(docs, embedding=embeddings)
 
 
-def rebuild_user_vectorstore(docs: list[Document], user_id: str) -> Chroma:
-    """Hard reset Chroma Cloud collection and rebuild from provided docs."""
-    # Read current app-cached store object if present.
-    existing_store = get_or_create_cached_vectorstore(user_id)
-
-    # Best-effort clear of existing collection content before directory removal.
-    if existing_store is not None:
-        try:
-            # Preferred collection-level wipe when supported.
-            existing_store.delete_collection()
-        except Exception:
-            try:
-                # Fallback: delete all known IDs manually.
-                existing_ids = existing_store.get().get("ids", [])
-                if existing_ids:
-                    existing_store.delete(ids=existing_ids)
-            except Exception:
-                # Ignore cleanup failures and continue hard-reset flow.
-                pass
-    # Clear app-level cache before rebuilding so stale objects are not reused.
-    clear_vectorstore_cache()
-
-    # Build fresh collection contents from current valid docs.
-    new_store = get_or_create_cached_vectorstore(user_id)
-    if docs:
-        new_store.add_documents(docs)
-    # Invalidate cached handles so future reads use newly persisted data.
-    clear_vectorstore_cache()
-    # Return rebuilt store handle.
-    return get_or_create_cached_vectorstore(user_id)
-
-
-# -----------------------------
-# Incremental Upsert Path
-# -----------------------------
 def upsert_documents(vs: Chroma, new_docs: list[Document], system_code: str):
-    """Incrementally sync incoming docs with existing docs for a given system code."""
-    # Map incoming docs by job name for quick lookup.
+    # Build a dict of {job_name: Document} from the newly uploaded file,
+    # so we can look up each job by name efficiently.
     new_by_job = {doc.metadata["job_name"]: doc for doc in new_docs}
 
-    # Buffers for existing IDs/metadatas fetched per incoming job.
     existing_ids, existing_metas = [], []
 
-    # Fetch existing store entries matching each incoming job name.
+    # For each job in the new upload, query the store by job_name to find any existing entry.
     for job_name in new_by_job:
         result = vs.get(where={"job_name": job_name})
-        existing_ids.extend(result["ids"])
-        existing_metas.extend(result["metadatas"])
+        existing_ids.extend(result["ids"])         # ChromaDB internal IDs of matched documents
+        existing_metas.extend(result["metadatas"]) # metadata dicts of matched documents
 
-    # Build existing lookup to compare row-hash changes.
+    # Build a lookup of {job_name: {id, row_hash}} for jobs already in the store
+    # that match names in the incoming file. Used to compare hashes below.
     old_by_job = {
         meta["job_name"]: {"id": doc_id, "row_hash": meta["row_hash"]}
         for doc_id, meta in zip(existing_ids, existing_metas)
     }
 
-    # Prepare delete/add action lists.
-    to_delete, to_add = [], []
+    to_delete, to_add = [], []  # accumulate IDs to delete and documents to add
 
-    # Compare incoming docs against existing docs by job name.
     for job_name, new_doc in new_by_job.items():
         if job_name not in old_by_job:
-            # New job: add it.
+            # New job not yet in the store — queue for addition
             to_add.append(new_doc)
         elif new_doc.metadata["row_hash"] != old_by_job[job_name]["row_hash"]:
-            # Changed job: delete old doc ID and add new doc.
+            # Job exists but content has changed — queue old entry for deletion and re-add.
+            # ChromaDB has no in-place update, so delete + add is the required pattern.
             to_delete.append(old_by_job[job_name]["id"])
             to_add.append(new_doc)
-        # Unchanged job: no action.
+        # Hash matches — row is unchanged, no action needed
 
-    # Identify jobs previously in this system but removed from incoming file set.
+    # Find jobs in the store that belong to this system but are missing from the new upload.
+    # Scoping by system_code ensures jobs from other systems are never affected.
     system_existing = vs.get(where={"system_code": system_code})
     system_job_names_in_store = {meta["job_name"] for meta in system_existing["metadatas"]}
     incoming_job_names = set(new_by_job.keys())
 
-    # Queue deletions for jobs removed from incoming set.
+    # Jobs present in the store for this system but absent in the new file have been removed
     for job_name in system_job_names_in_store - incoming_job_names:
         result = vs.get(where={"job_name": job_name})
         to_delete.extend(result["ids"])
 
-    # Execute batched deletions if needed.
     if to_delete:
         vs.delete(ids=to_delete)
 
-    # Execute batched additions if needed.
     if to_add:
         vs.add_documents(to_add)
 
-    # Ensure all sessions reload updated data on next access.
-    clear_vectorstore_cache()
-
-    # Return change counts for UI logging.
     return len(to_delete), len(to_add)
 
 
-# -----------------------------
-# Access Control
-# -----------------------------
-# Reject access when user is not logged in or does not have admin prefix.
+# --- Page access control ---
+# Redirect non-logged-in users and non-admins back to the main page.
+# Any username starting with "admin" is treated as an admin.
 if not is_logged_in() or not current_user().lower().startswith("admin"):
     st.switch_page("main.py")
+    st.stop()
 
 
-# -----------------------------
-# Page Header
-# -----------------------------
-# Render page title.
+# --- Page UI ---
 st.title("Admin Page")
-# Render personalized greeting.
 st.write(f"Welcome, **{current_user()}**!")
 
-# Draw section divider.
 st.divider()
 
-
-# -----------------------------
-# Existing Store Summary
-# -----------------------------
-# Load/cached store for this session (and disk if available).
-current_store = get_session_vectorstore()
-if current_store is not None:
-    # Show summary title when store exists.
+# Show a live summary of jobs per system currently in the vector store.
+# Reads directly from the shared store so it reflects the latest state after every rerun.
+shared = get_shared_store()
+if shared["vectorstore"] is not None:
     st.subheader("📊 Jobs in Vector Store")
-    # Render per-system count table.
-    st.dataframe(get_store_summary(current_store), hide_index=True, use_container_width=True)
+    st.dataframe(get_store_summary(shared["vectorstore"]), hide_index=True, use_container_width=True)
 else:
-    # Explain there is no indexed content yet.
     st.info("No documents indexed yet. Upload an operating manual below to get started.")
 
-# Draw section divider.
 st.divider()
 
-
-# -----------------------------
-# Input State Initialization
-# -----------------------------
-# Initialize flag that controls when system-code input should be reset.
+# Initialise the clear flag used to reset the system code field after indexing.
+# Must be set before the widget renders so the reset happens on the correct rerun.
 if "clear_system_code" not in st.session_state:
     st.session_state.clear_system_code = False
 
-# If last run requested an input reset, clear widget value before rendering it.
+# If a previous indexing run set the clear flag, reset the widget value and clear the flag
+# before the widget is instantiated — this is the only safe window to modify a widget's key.
 if st.session_state.clear_system_code:
     st.session_state.clear_system_code = False
     st.session_state.system_code_input = ""
 
-
-# -----------------------------
-# Indexing Inputs
-# -----------------------------
-# System code input used to filter rows and tag metadata.
 system_code = st.text_input("🔑 System Code (e.g. DKS)", key="system_code_input").strip().upper()
 
-# Allow selecting multiple Excel files in one indexing run.
-uploaded_files = st.file_uploader(
-    "📄 Upload Operating Manual files (.xlsx)",
-    type=["xlsx"],
-    accept_multiple_files=True,
-)
+uploaded_file = st.file_uploader("📄 Upload an Operating Manual (.xlsx)", type=["xlsx"])
 
-if uploaded_files:
-    # Normalize selected names and create stable files key.
-    file_names = sorted(file.name for file in uploaded_files)
-    files_key = tuple(file_names)
-    # Persist key in session for inspection/debugging.
-    st.session_state.files_key = files_key
-    # Show load confirmation to the admin.
-    st.success(f"Loaded {len(uploaded_files)} file(s): {', '.join(file_names)}")
+if uploaded_file:
+    st.success(f"Loaded: {uploaded_file.name}")
 
-    # Initialize last-indexed key tracker once.
-    if "last_indexed_files_key" not in st.session_state:
-        st.session_state.last_indexed_files_key = None
-
-    # Run indexing only when button is pressed.
     if st.button("Index Document"):
-        # Enforce required system code.
         if not system_code:
             st.error("Please enter a System Code before indexing.")
-        # Avoid repeated indexing for exactly same selected file set in this session.
-        elif st.session_state.last_indexed_files_key == files_key:
-            st.info("These files are already indexed for this session. Upload a different set to re-index.")
         else:
-            # Show spinner during parsing/embedding/store operations.
             with st.spinner("Indexing..."):
-                # Merge chunks from all selected files into one list.
-                docs = []
-                for uploaded_file in uploaded_files:
-                    docs.extend(load_and_split(uploaded_file, system_code))
+                docs = load_and_split(uploaded_file, system_code)
 
-                # Initialize index history log list once.
                 if "index_log" not in st.session_state:
                     st.session_state.index_log = []
 
-                # Filter docs by system code prefix in job name.
-                valid_docs = [d for d in docs if d.metadata["job_name"].upper().startswith(system_code)]
-                # Count skipped rows that do not match system code prefix.
-                invalid = len(docs) - len(valid_docs)
-
-                # Stop early when nothing valid is left to index.
-                if not valid_docs:
-                    st.error(f"No jobs found with prefix '{system_code}'. Please check the system code and try again.")
-                else:
-                    # Warn for skipped rows outside current system prefix.
-                    if invalid:
-                        st.warning(f"{invalid} job(s) skipped — job name does not start with '{system_code}'.")
-
-                    # First-time store creation when no existing store is loaded.
-                    if current_store is None:
-                        build_vectorstore(valid_docs, "user")
-                        clear_vectorstore_cache()
-                        msg = f"✅ {len(uploaded_files)} file(s) ({system_code}) — {len(valid_docs)} jobs added"
+                if shared["vectorstore"] is None:
+                    # First upload — build the vector store from scratch
+                    valid_docs = [d for d in docs if d.metadata["job_name"].upper().startswith(system_code)]
+                    invalid = len(docs) - len(valid_docs)
+                    if not valid_docs:
+                        st.error(f"No jobs found with prefix '{system_code}'. Please check the system code and try again.")
                     else:
-                        # Check whether this system code already exists in current store.
-                        existing_for_system = current_store.get(where={"system_code": system_code})
-                        if existing_for_system.get("ids"):
-                            # Existing system code: hard reset and rebuild to avoid duplicate accumulation.
-                            rebuild_user_vectorstore(valid_docs, "user")
-                            msg = (
-                                f"✅ {len(uploaded_files)} file(s) ({system_code}) — "
-                                f"system code already existed, store was reset and rebuilt with {len(valid_docs)} jobs"
-                            )
-                        else:
-                            # New system code in an existing store: incremental upsert path.
-                            deleted, added = upsert_documents(current_store, valid_docs, system_code)
-                            msg = (
-                                f"✅ {len(uploaded_files)} file(s) ({system_code}) — "
-                                f"{added} job(s) added/updated, {deleted} job(s) removed"
-                            )
-
-                    # Append result message to history log.
-                    st.session_state.index_log.append(msg)
-                    # Track last indexed file set.
-                    st.session_state.last_indexed_files_key = files_key
-                    # Request system code input clear on next rerun.
-                    st.session_state.clear_system_code = True
-                    # Trigger rerun so UI reflects latest store state.
-                    st.rerun()
+                        if invalid:
+                            st.warning(f"{invalid} job(s) skipped — job name does not start with '{system_code}'.")
+                        shared["vectorstore"] = build_vectorstore(valid_docs)
+                        msg = f"✅ {uploaded_file.name} ({system_code}) — {len(valid_docs)} jobs added"
+                        st.session_state.index_log.append(msg)
+                        st.session_state.clear_system_code = True
+                        st.rerun()
+                else:
+                    # Subsequent upload — diff against existing store and apply changes only
+                    valid_docs = [d for d in docs if d.metadata["job_name"].upper().startswith(system_code)]
+                    invalid = len(docs) - len(valid_docs)
+                    if not valid_docs:
+                        st.error(f"No jobs found with prefix '{system_code}'. Please check the system code and try again.")
+                    else:
+                        if invalid:
+                            st.warning(f"{invalid} job(s) skipped — job name does not start with '{system_code}'.")
+                        deleted, added = upsert_documents(shared["vectorstore"], valid_docs, system_code)
+                        msg = f"✅ {uploaded_file.name} ({system_code}) — {added} job(s) added/updated, {deleted} job(s) removed"
+                        st.session_state.index_log.append(msg)
+                        st.session_state.clear_system_code = True
+                        st.rerun()
 else:
-    # Prompt user to upload files before indexing.
     st.info("Upload operating manuals to enable jobs analysis Q&A.")
 
-# Draw section divider.
 st.divider()
 
-
-# -----------------------------
-# Indexing History
-# -----------------------------
-# Show indexing history if it exists and contains entries.
+# Display a persistent log of all indexing actions performed this session
 if "index_log" in st.session_state and st.session_state.index_log:
     st.subheader("📋 Indexed Documents")
     for entry in st.session_state.index_log:
         st.write(entry)
 
-# Draw section divider.
 st.divider()
 
-
-# -----------------------------
-# Logout Action
-# -----------------------------
-# Render logout button and clear auth session when clicked.
 if st.button("Logout"):
     logout()
     st.switch_page("main.py")
+    st.stop()

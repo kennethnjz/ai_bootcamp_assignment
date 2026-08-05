@@ -2,6 +2,8 @@
 import json
 # Standard library import for all pattern matching used in job extraction.
 import re
+# Path helper used to validate persisted vector store directories.
+from pathlib import Path
 # Used to print full stack traces when chat calls fail.
 import traceback
 
@@ -9,14 +11,12 @@ import traceback
 import streamlit as st
 # OpenAI SDK client for chat completion calls.
 from openai import OpenAI
-# Chroma vector store class for remote embeddings retrieval.
+# Chroma vector store class for persisted embeddings retrieval.
 from langchain_chroma import Chroma
+# LangChain OpenAI embedding model wrapper.
+from langchain_openai import OpenAIEmbeddings
 # Authentication and user-scoped vector-store utilities from local module.
-from auth import is_logged_in, current_user, logout
-# Shared app-level cache helper used by both admin and user pages.
-from vectorstore_cache import get_cached_vectorstore
-from pages.store_utils import get_shared_store, get_store_summary
-from pages.diagram_utils import build_sequence_diagram_prompt, extract_job_series_from_prompt
+from auth import is_logged_in, current_user, logout, get_vectorstore_key, get_vectorstore_dir
 
 
 # Regex used to detect job IDs (including optional suffixes like '@' or '-') in text.
@@ -58,20 +58,42 @@ def build_rag_system_prompt(context: str) -> str:
         "If that is the case, calculate the starting run time by tracing the scheduling instructions of the job ID and add the estimated run time of that job to the starting run time.\n"
         "8. Do not invent, infer, or add any other job ID that is not directly present in the text.\n"
         '9. If the answer is not in the context, say "I couldn\'t find that information in the uploaded document."\n\n'
-        "10. If the job's last run date is mentioned and is before the current date, indicate that the job is overdue and do not include it in your result.\n"
         f"Context:\n{context}"
     )
 
 
-def render_visualization_fullscreen(sequence_diagram: str, graphviz_diagram: str):
-    """Render a full-page visualization viewer with no modal clipping."""
-    st.subheader("Visualization Viewer")
-    tabs = st.tabs(["Sequence Diagram", "Job Dependency Graph"])
-
-    with tabs[0]:
-        st.mermaid_chart(sequence_diagram)
-    with tabs[1]:
-        st.graphviz_chart(graphviz_diagram)
+def build_sequence_diagram_prompt(context: str) -> str:
+    """Create the prompt that asks the model for dependency JSON, not Mermaid syntax."""
+    # Return detailed JSON-only instructions so downstream parsing is deterministic.
+    return (
+        "You are given the retrieved job documents. "
+        "Return only a single JSON object with no markdown fences and no explanation.\n\n"
+        "Output schema:\n"
+        '{\n'
+        '    "job_ID": "JOB_ID_1",\n'
+        '    "edges": [\n'
+        '        {"from": "JOB_ID_2", "to": "JOB_ID_3"},\n'
+        '        {"from": "JOB_ID_2", "to": "JOB_ID_4"}\n'
+        '    ]\n'
+        '}\n\n'
+        "Instructions:\n"
+        "1. Include every explicitly named job ID from the retrieved context in the final dependency graph. "
+        "This includes the main job and every dependent job that appears in the text.\n"
+        "2. The 'job_ID' field must contain the main job ID that appears in the retrieved context.\n"
+        "3. The 'edges' field must contain the full dependency relationship list. "
+        "Each edge must use 'from' and 'to' keys, where 'from' is the job that runs before 'to'.\n"
+        "4. Do not omit any job that is clearly named in the text, including jobs like DKSD012 or suffixed forms like DKSD002@.\n"
+        "5. Only include job IDs that are explicitly written in the retrieved context as job names. "
+        "Do not invent, infer, or add any other job ID that is not directly present in the text.\n"
+        "6. Ignore any non-job entities, labels, or descriptive words.\n"
+        "7. Determine the dependencies from the document evidence, not from alphabetical order.\n"
+        "8. The 'edges' array must represent all explicit dependency links between jobs.\n"
+        "9. Every value in the JSON object must be a bare job ID only, such as DKSD004 or DKSM018. "
+        "Do not include arrows, participant lines, markdown fences, or Mermaid syntax.\n"
+        "10. JSON must be valid and parseable with Python's json.loads().\n"
+        "11. Do not add any prose outside the JSON object.\n"
+        f"Context:\n{context}"
+    )
 
 
 def sanitize_mermaid_identifier(name: str) -> str:
@@ -410,7 +432,7 @@ def extract_job_dependency_order(context: str) -> list[str]:
     return ordered_jobs or all_jobs
 
 
-def build_run_sequence_diagram(store, focus_jobs: list[str] | None = None) -> tuple[str, str]:
+def build_run_sequence_diagram(store) -> tuple[str, str]:
     """Retrieve context, ask model for dependency JSON, and build Mermaid + Graphviz diagrams."""
     # Retrieval query focused on explicit run-order phrasing.
     default_prompt = (
@@ -419,17 +441,10 @@ def build_run_sequence_diagram(store, focus_jobs: list[str] | None = None) -> tu
         "when they appear in the text."
     )
 
-    if focus_jobs:
-        default_prompt = (
-            f"Extract the dependency graph for the requested job series: {', '.join(focus_jobs)}. "
-            "Use explicit dependency phrases such as 'runs after', 'depends on', or 'must run after' "
-            "when they appear in the text."
-        )
-
     # Pull a broad context window to increase chance of finding all job links.
     context, _ = retrieve_context(store, default_prompt, k=25)
     # Build strict JSON output instructions for sequence extraction.
-    system_prompt = build_sequence_diagram_prompt(context, focus_jobs=focus_jobs)
+    system_prompt = build_sequence_diagram_prompt(context)
 
     # Call the model in non-streaming mode to get one JSON payload.
     response = client.chat.completions.create(
@@ -466,24 +481,26 @@ def build_run_sequence_diagram(store, focus_jobs: list[str] | None = None) -> tu
 system_prompt_no_doc = "You are a helpful assistant."
 
 
-def load_persisted_store_for(user_id: str) -> Chroma | None:
-    """Load app-cached Chroma Cloud vector store by owner id if present."""
-    # Resolve shared app-level cached handle for this owner id.
-    return get_cached_vectorstore(user_id)
-
-
 def load_persisted_user_store() -> Chroma | None:
-    """Load the logged-in user's Chroma Cloud vector store if present."""
-    # The shared helper stores the vector store inside a mutable wrapper dict.
-    shared_store = get_shared_store()
-    if isinstance(shared_store, dict):
-        return shared_store.get("vectorstore")
-    return shared_store
+    """Load the logged-in user's persisted Chroma vector store from disk if present."""
+    # Resolve persisted vector store folder for current user.
+    persist_dir = get_vectorstore_dir(current_user())
+    # Return None if directory does not exist or is empty.
+    if not Path(persist_dir).exists() or not any(Path(persist_dir).iterdir()):
+        return None
+
+    # Configure embedding model used by this vector store.
+    embeddings = OpenAIEmbeddings(
+        model="text-embedding-3-small",
+        api_key=st.secrets["OPENAI_API_KEY"],
+    )
+    # Open existing Chroma store using the persisted directory and embeddings.
+    return Chroma(persist_directory=persist_dir, embedding_function=embeddings)
 
 
 # Initialize default retrieval depth in session state.
 if "k_value" not in st.session_state:
-    st.session_state.k_value = 100
+    st.session_state.k_value = 4
 # Initialize default chat model in session state.
 if "model" not in st.session_state:
     st.session_state.model = "gpt-4o-mini"
@@ -516,49 +533,36 @@ st.info("You have standard user access.")
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Resolve vector store for this request using shared app-level cache.
-active_owner = current_user()
-# First preference: the logged-in user's own persisted store.
-store = load_persisted_user_store()
-# Fallback: shared admin-indexed store under the literal "user" scope.
-if store is None:
-    store = load_persisted_store_for("user")
-    if store is not None:
-        active_owner = "user"
+# Build per-user session key for vector store object caching.
+store_key = get_vectorstore_key(current_user())
+# Load persisted vector store when not already cached in session.
+if store_key not in st.session_state or st.session_state[store_key] is None:
+    st.session_state[store_key] = load_persisted_user_store()
 
 # Render sequence diagram and graph only when a vector store exists.
-if store is not None:
-    if "diagram_focus_jobs" not in st.session_state:
-        st.session_state.diagram_focus_jobs = []
+if store_key in st.session_state and st.session_state[store_key] is not None:
+    # Grab cached store from session.
+    store = st.session_state[store_key]
     # Read metadata for UI summary count.
-    st.subheader("📊 Jobs in Vector Store")
-    st.dataframe(get_store_summary(store), hide_index=True, use_container_width=True)
-    # store_meta = store.get()
-    # Confirm vector store availability and indicate source scope.
-    if active_owner.lower() == current_user().lower():
-        st.success(f"Vector store is available for user '{current_user()}'.")
-    else:
-        st.success(f"Using shared vector store from '{active_owner}'.")
+    store_meta = store.get()
+    # Confirm vector store availability to user.
+    st.success(f"Vector store is available for user '{current_user()}'.")
     # Show count of indexed document IDs from the store metadata.
-    # st.caption(f"Indexed documents in session store: {len(store_meta.get('ids', []))}")
+    st.caption(f"Indexed documents in session store: {len(store_meta.get('ids', []))}")
 
     # Generate diagrams with a loading spinner while model and parsing run.
-    focus_jobs = st.session_state.diagram_focus_jobs
     with st.spinner("Preparing run sequence diagram..."):
-        sequence_diagram, graphviz_diagram = build_run_sequence_diagram(store, focus_jobs=focus_jobs)
+        sequence_diagram, graphviz_diagram = build_run_sequence_diagram(store)
 
-    # Show a button-like trigger that opens a full-page visualization viewer.
-    if "show_visualization_viewer" not in st.session_state:
-        st.session_state.show_visualization_viewer = False
+    # Render Mermaid run sequence section title.
+    st.subheader("Job Run Sequence")
+    # Render Mermaid sequence diagram text.
+    st.mermaid_chart(sequence_diagram)
 
-    if st.button("Open Visualization Widget", key="open_visualization_widget_btn"):
-        st.session_state.show_visualization_viewer = True
-
-    if st.session_state.show_visualization_viewer:
-        if st.button("Close Visualization Widget", key="close_visualization_widget_btn"):
-            st.session_state.show_visualization_viewer = False
-        else:
-            render_visualization_fullscreen(sequence_diagram, graphviz_diagram)
+    # Render Graphviz dependency section title.
+    st.subheader("Job Dependency Graph")
+    # Render Graphviz digraph text.
+    st.graphviz_chart(graphviz_diagram)
 else:
     # Inform user that no store exists yet for retrieval-backed behavior.
     st.info("No vector store is available in this session yet.")
@@ -571,11 +575,6 @@ for message in st.session_state.messages:
 
 # Capture new user message from chat input box.
 if prompt := st.chat_input("Type a message..."):
-    focus_jobs = extract_job_series_from_prompt(prompt)
-    if focus_jobs:
-        st.session_state.diagram_focus_jobs = focus_jobs
-        st.session_state.show_visualization_viewer = True
-
     # Persist user message in chat history.
     st.session_state.messages.append({"role": "user", "content": prompt})
     # Render the just-submitted user message bubble.
@@ -586,9 +585,9 @@ if prompt := st.chat_input("Type a message..."):
     with st.chat_message("assistant"):
         try:
             # Use RAG context only when user-specific store is available.
-            if store is not None:
+            if store_key in st.session_state and st.session_state[store_key] is not None:
                 # Retrieve relevant context and source chunks for this user question.
-                context, source_docs = retrieve_context(store, prompt, k_value)
+                context, source_docs = retrieve_context(st.session_state[store_key], prompt, k_value)
                 # Build strict context-bound system prompt.
                 effective_system_prompt = build_rag_system_prompt(context)
             else:

@@ -29,8 +29,25 @@ def build_rag_system_prompt(context: str) -> str:
     """Create a strict RAG system prompt that limits answers to retrieved context only."""
     # Return a system instruction that prevents answers outside the provided context.
     return (
-        "Answer ONLY using the context below. "
-        'If the answer is not in the context, say "I couldn\'t find that information in the uploaded document."\n\n'
+        "Answer ONLY using the context below based on the following instructions. "
+        "Instructions:\n"
+        "1. These are the available job frequencies for each job and their meaning.\n"
+        "Daily - Runs every day from Monday to Friday.\n"
+        "Weekly - Runs every week.\n"
+        "Monthly - Runs every month.\n"
+        "Yearly - Runs every year.\n"
+        "On Request - Runs only when requested.\n"
+        "2. The number of the estimated run time is in the number of minutes.\n"
+        "3. The estimated volume of records to be processed may contain the specific format.\n"
+        "0 - 100K meaning a range from zero to a hundred thousand records. Interpret similar formats in this field as such.\n"
+        "Having a 'K' suffix means the number is in thousands.\n"
+        "4. The time format shown in the scheduling instructions is HH:MM PM/AM.\n"
+        "5. When the day of the week is displayed as Mon - Fri, it refers to Monday through Friday. Interpret similar formats in this field as such.\n"
+        "6. The days of the week in the scheduling instructions include Mon - Monday, Tue - Tuesday, Wed - Wednesday, Thu - Thursday, Fri - Friday.\n"
+        "7. If there are any scheduling instructions that do not specify the time or day of the week, look for keywords such as 'Run after' with a specific job ID, and 'to run a specific job ID after'.\n"
+        "If that is the case, calculate the starting run time by tracing the scheduling instructions of the job ID and add the estimated run time of that job to the starting run time.\n"
+        "8. Do not invent, infer, or add any other job ID that is not directly present in the text.\n"
+        '9. If the answer is not in the context, say "I couldn\'t find that information in the uploaded document."\n\n'
         f"Context:\n{context}"
     )
 
